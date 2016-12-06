@@ -1,81 +1,261 @@
 #!/usr/bin/env python
 
-import sys, socket, select, time, json, random
+import sys, socket, select, json, random
+from time import time
 from logger import Logger
+
+'''
+types of messages so far and their mapping to the Raft paper:
+
+request_vote: RequestVoteRPC
+request_vote_result: RequestVoteRPC.Results
+append_entries: AppendEntriesRPC
+append_entries_result: AppendEntriesRPC.Results
+'''
+
+HEARTBEAT_INTERVAL = .05  # every 50ms
 
 
 class Server():
-    def __init__(self, my_id, replica_ids):
-        log.success("server_start", id=my_id)
+	def __init__(self, my_id, replica_ids):
+		log.success("server_start", id=my_id)
 
-        self.id = my_id
-        self.replica_ids = replica_ids
-        self.leader = 'FFFF'  # TODO: are we the leader on start or do we say we don't know
+		self.id = my_id
+		self.replica_ids = replica_ids
+		self.leader = 'FFFF'  # unknown leader
+		self.current_term = 0
+		self.last_heard_rpc = time()  # the last time we heard from a leader/candidate in seconds
+		self.election_timeout = random.uniform(.15, .3)  # 150-300 ms, in seconds
+		self.is_candidate = False
+		self.voted_for = None  # candidateId that received vote in current term (or null if none)
+		self.votes_earned = 0  # votes earned during this term
+		self.last_heartbeat = 0  # last time we sent out a heartbeat in seconds
 
-        # Connect to the network. All messages to/from other replicas and clients will
-        # occur over this socket
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        self.sock.connect(self.id)
+		# Connect to the network. All messages to/from other replicas and clients will
+		# occur over this socket
+		self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+		self.sock.connect(self.id)
 
-    def start(self):
-        while True:
-            ready = select.select([self.sock], [], [], 0.1)[0]
+	def is_leader(self):
+		return self.leader == self.id
 
-            if self.sock in ready:
-                msg_raw = self.sock.recv(32768)
+	def is_leader_unknown(self):
+		return self.leader == 'FFFF'
 
-                if len(msg_raw) == 0: continue
-                msg = json.loads(msg_raw)
+	def election_timeout_reached(self):
+		return (time() - self.last_heard_rpc) > self.election_timeout \
+			   and not self.is_leader()
 
-                if msg['type'] == 'get':
-                    self.handle_get(msg)
-                elif msg['type'] == 'put':
-                    self.handle_put(msg)
-                else:
-                    log.warning('received unexpected type: ' + msg['type'])
+	def has_majority_votes(self):
+		majority = ((len(replica_ids) + 1) // 2) + 1  # number of servers needed for quorom
 
-    def handle_get(self, msg):
-        log.success('received_get', id=self.id, client_id=msg['src'], key=msg['key'])
-        self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+		return self.votes_earned >= majority
 
-    def handle_put(self, msg):
-        log.success('received_put', id=self.id, client_id=msg['src'], key=msg['key'], value=msg['value'])
-        self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+	def start(self):
+		while True:
+			if self.election_timeout_reached():
+				self.begin_election()
+			elif self.is_candidate:
+				self.check_candidate_status()
+			elif self.is_leader():
+				self.broadcast_hearbeat()
 
-    def send_fail_msg(self, dst, mid):
-        # sends a message of type fail to the given dst with the given MID
-        log.info("replied_with_fail", id=self.id, client_id=dst)
-        msg = {'src': my_id,
-               'dst': dst,
-               'leader': self.leader,
-               'type': 'fail',
-               'MID': mid}
+			ready = select.select([self.sock], [], [], 0.1)[0]
 
-        self.send_msg(msg)
+			if self.sock in ready:
+				msg_raw = self.sock.recv(32768)
 
-    def send_msg(self, msg):
-        # takes in a dictionary, serializes it and sends it across the wire
-        try:
-            self.sock.send(json.dumps(msg))
-        except Exception, e:
-            log.info("Unable to send msg: " + msg)
+				if len(msg_raw) == 0: continue
+				msg = json.loads(msg_raw)
+
+				if msg['type'] == 'get':
+					self.handle_get(msg)
+				elif msg['type'] == 'put':
+					self.handle_put(msg)
+				elif msg['type'] == 'request_vote':
+					self.handle_vote_request(msg)
+				elif msg['type'] == 'request_vote_result':
+					self.handle_vote_result(msg)
+				elif msg['type'] == 'append_entries':
+					self.handle_append_entries(msg)
+				else:
+					log.warning('received unexpected type: ' + msg['type'])
+
+	def handle_get(self, msg):
+		log.success('received_get', id=self.id, client_id=msg['src'], key=msg['key'])
+
+		if not self.is_leader() and not self.is_leader_unknown():
+			# we aren't the leader but we know who is
+			self.redirect_msg(dst=msg['src'], mid=msg['MID'])
+		elif self.is_leader():
+			# TODO:  actually do something
+			msg = {'src': self.id,
+				   'dst': msg['src'],
+				   'leader': self.leader,
+				   'type': 'ok',
+				   'MID': msg['MID']}
+
+			self.send_msg(msg)
+		else:
+			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+
+	def handle_put(self, msg):
+		log.success('received_put', id=self.id, client_id=msg['src'], key=msg['key'], value=msg['value'])
+
+		if not self.is_leader() and not self.is_leader_unknown():
+			# we aren't the leader but we know who is
+			self.redirect_msg(dst=msg['src'], mid=msg['MID'])
+		elif self.is_leader():
+			#TODO:  actually do something
+			msg = {'src': self.id,
+				   'dst': msg['src'],
+				   'leader': self.leader,
+				   'type': 'ok',
+				   'MID': msg['MID']}
+
+			self.send_msg(msg)
+		else:
+			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+
+	def handle_vote_request(self, msg):
+		if msg['term'] < self.current_term:
+			self.deny_vote(dst=msg['src'])
+		elif self.voted_for == None or self.voted_for == msg['src']:
+			# TODO: "and candidate's log is at least as up-to-date as receiver's log"
+			self.grant_vote(dst=msg['src'])
+
+	def handle_vote_result(self, msg):
+		if self.is_candidate and msg['vote_granted']:
+			log.success('received_vote', id=self.id, term=self.current_term, src=msg['src'])
+			self.votes_earned += 1
+
+	def handle_append_entries(self, msg):
+		self.last_heard_rpc = time()
+		if self.is_candidate and msg['term'] >= self.current_term:
+			#  have found a new leader
+			log.success("found_new_leader", id=self.id, new_leader=msg['src'], new_term=msg['term'])
+			self.leader = msg['src']
+			self.current_term = msg['term']
+			self.reset_candidacy()
+
+	def send_fail_msg(self, dst, mid):
+		# sends a message of type fail to the given dst with the given MID
+		log.info("replied_with_fail", id=self.id, client_id=dst)
+		msg = {'src': self.id,
+			   'dst': dst,
+			   'leader': self.leader,
+			   'type': 'fail',
+			   'MID': mid}
+
+		self.send_msg(msg)
+
+	def send_msg(self, msg):
+		# takes in a dictionary, serializes it and sends it across the wire
+		try:
+			self.sock.send(json.dumps(msg))
+		except Exception, e:
+			log.info("Unable to send msg: " + msg)
+
+	def begin_election(self):
+		# starts election process, Section 5.2
+		log.success("election_start", id=self.id, new_term=self.current_term + 1)
+		self.leader = 'FFFF'
+		self.current_term += 1
+		self.is_candidate = True
+		self.last_heard_rpc = time()  # restart election timeout countdown
+
+		# vote for self
+		self.voted_for = self.id
+		self.votes_earned = 1
+
+		self.send_request_votes()
+
+	def send_request_votes(self):
+		msg = {'src': self.id,
+			   'dst': 'FFFF',  # broadcast
+			   'leader': self.leader,
+			   'type': 'request_vote',
+			   'term': self.current_term}
+
+		self.send_msg(msg)
+
+	# TODO: include lastLogIndex and lastLogTerm
+
+	def check_candidate_status(self):
+		if self.has_majority_votes():
+			#  become kim jong un
+			log.success("became_leader", id=self.id, term=self.current_term, num_votes = self.votes_earned)
+			self.leader = self.id
+			self.reset_candidacy()
+			self.broadcast_hearbeat()
+
+	def broadcast_hearbeat(self):
+		curr_time = time()
+		if (curr_time - self.last_heartbeat) > HEARTBEAT_INTERVAL:
+			self.last_heartbeat = curr_time
+			msg = {'src': self.id,
+				   'dst': 'FFFF',  # broadcast
+				   'leader': self.leader,
+				   'type': 'append_entries',
+				   'term': self.current_term,
+				   'entries': []}  # empty for heartbeat
+
+			# TODO: implement prevLogIndex, prevLogTerm, leaderCommit
+			self.send_msg(msg)
+
+	def deny_vote(self, dst):
+		self.reply_to_vote(dst=dst, vote_granted=False)
+
+	def grant_vote(self, dst):
+		self.reply_to_vote(dst=dst, vote_granted=True)
+
+	def reply_to_vote(self, dst, vote_granted):
+		msg = {'src': self.id,
+			   'dst': dst,
+			   'leader': self.leader,
+			   'type': 'request_vote_result',
+			   'term': self.current_term,
+			   'vote_granted': vote_granted}
+
+		self.send_msg(msg)
+
+	def reset_candidacy(self):
+		#  when we are done being a candidate
+		self.is_candidate = False
+		self.voted_for = None
+		self.votes_earned = 0
+
+	def redirect_msg(self, dst, mid):
+		log.success("redirect", id=self.id, client_id=dst, leader=self.leader)
+		msg = {'src': self.id,
+			   'dst': dst,
+			   'leader': self.leader,
+			   'type': 'redirect',
+			   'MID': mid}
+
+		self.send_msg(msg)
 
 
 if __name__ == "__main__":
-    # Your ID number
-    my_id = sys.argv[1]
+	# Your ID number
+	my_id = sys.argv[1]
 
-    # The ID numbers of all the other replicas
-    replica_ids = sys.argv[2:]
+	# The ID numbers of all the other replicas
+	replica_ids = sys.argv[2:]
 
-    log = Logger({
-        "server_start": "Server {id} starting up",
-        "received_get": "Server {id} receieved a GET request for key {key} from client {client_id}",
-        "received_put": "Server {id} receieved a PUT request for key/value {key}/{value} from client {client_id}",
-        "replied_with_fail": "Server {id} replied to client {client_id} with a fail message"
-    })
+	log = Logger({
+		"server_start": "Server {id} starting up",
+		"received_get": "Server {id} receieved a GET request for key {key} from client {client_id}",
+		"received_put": "Server {id} receieved a PUT request for key/value {key}/{value} from client {client_id}",
+		"replied_with_fail": "Server {id} replied to client {client_id} with a fail message",
+		"election_start": "Server {id} has started an election for the next term: {new_term}",
+		"received_vote": "Server {id} has received a vote for term {term} from {src}",
+		"found_new_leader": "Server {id} has picked a new leader: {new_leader} with term {new_term}",
+		"became_leader": "Server {id} has just become the leader for term {term} with {num_votes} votes",
+		"redirect": "Server {id} has redirected a request from client {client_id} to the leader {leader}"
+	})
 
-    server = Server(my_id, replica_ids)
+	server = Server(my_id, replica_ids)
 
-    # start up the bridge
-    server.start()
+	# start up the bridge
+	server.start()
