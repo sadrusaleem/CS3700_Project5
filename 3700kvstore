@@ -5,12 +5,7 @@ from time import time
 from logger import Logger
 
 '''
-types of messages so far and their mapping to the Raft paper:
-
-request_vote: RequestVoteRPC
-request_vote_result: RequestVoteRPC.Results
-append_entries: AppendEntriesRPC
-append_entries_result: AppendEntriesRPC.Results
+I tried my best to document, but this is all from the Raft paper
 '''
 
 HEARTBEAT_INTERVAL = .05  # every 50ms
@@ -30,6 +25,7 @@ class Server():
 		self.voted_for = None  # candidateId that received vote in current term (or null if none)
 		self.votes_earned = 0  # votes earned during this term
 		self.last_heartbeat = 0  # last time we sent out a heartbeat in seconds
+		self.data_store = {} #  key/value pairs from clients, ie. the 'state machine'
 
 		# Connect to the network. All messages to/from other replicas and clients will
 		# occur over this socket
@@ -88,14 +84,9 @@ class Server():
 			# we aren't the leader but we know who is
 			self.redirect_msg(dst=msg['src'], mid=msg['MID'])
 		elif self.is_leader():
-			# TODO:  actually do something
-			msg = {'src': self.id,
-				   'dst': msg['src'],
-				   'leader': self.leader,
-				   'type': 'ok',
-				   'MID': msg['MID']}
-
-			self.send_msg(msg)
+			log.success('leader_get', id=self.id, key=msg['key'])
+			value = self.data_store[msg['key']]
+			self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=value)
 		else:
 			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
@@ -106,14 +97,9 @@ class Server():
 			# we aren't the leader but we know who is
 			self.redirect_msg(dst=msg['src'], mid=msg['MID'])
 		elif self.is_leader():
-			#TODO:  actually do something
-			msg = {'src': self.id,
-				   'dst': msg['src'],
-				   'leader': self.leader,
-				   'type': 'ok',
-				   'MID': msg['MID']}
-
-			self.send_msg(msg)
+			log.success('leader_put', id=self.id, key=msg['key'], value=msg['value'])
+			self.data_store[msg['key']] = msg['value']
+			self.send_ok_put_msg(dst=msg['src'], mid=msg['MID'])
 		else:
 			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
@@ -235,6 +221,25 @@ class Server():
 
 		self.send_msg(msg)
 
+	def send_ok_put_msg(self, dst, mid):
+		msg = {'src': self.id,
+			   'dst': dst,
+			   'leader': self.leader,
+			   'type': 'ok',
+			   'MID': mid}
+
+		self.send_msg(msg)
+
+	def send_ok_get_msg(self, dst, mid, value):
+		msg = {'src': self.id,
+			   'dst': dst,
+			   'leader': self.leader,
+			   'type': 'ok',
+			   'MID': mid,
+			   'value': value}
+
+		self.send_msg(msg)
+
 
 if __name__ == "__main__":
 	# Your ID number
@@ -250,9 +255,11 @@ if __name__ == "__main__":
 		"replied_with_fail": "Server {id} replied to client {client_id} with a fail message",
 		"election_start": "Server {id} has started an election for the next term: {new_term}",
 		"received_vote": "Server {id} has received a vote for term {term} from {src}",
-		"found_new_leader": "Server {id} has picked a new leader: {new_leader} with term {new_term}",
+		"found_new_leader": "Server {id} has found the new leader: {new_leader} for term {new_term}",
 		"became_leader": "Server {id} has just become the leader for term {term} with {num_votes} votes",
-		"redirect": "Server {id} has redirected a request from client {client_id} to the leader {leader}"
+		"redirect": "Server {id} has redirected a request from client {client_id} to the leader {leader}",
+		"leader_put": "Leader {id} has put into the data_store key/value {key}/{value}",
+		"leader_get": "Leader {id} has responded to a GET request for key {key}"
 	})
 
 	server = Server(my_id, replica_ids)
