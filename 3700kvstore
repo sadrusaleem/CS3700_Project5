@@ -1,0 +1,81 @@
+#!/usr/bin/env python
+
+import sys, socket, select, time, json, random
+from logger import Logger
+
+
+class Server():
+    def __init__(self, my_id, replica_ids):
+        log.success("server_start", id=my_id)
+
+        self.id = my_id
+        self.replica_ids = replica_ids
+        self.leader = 'FFFF'  # TODO: are we the leader on start or do we say we don't know
+
+        # Connect to the network. All messages to/from other replicas and clients will
+        # occur over this socket
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.connect(self.id)
+
+    def start(self):
+        while True:
+            ready = select.select([self.sock], [], [], 0.1)[0]
+
+            if self.sock in ready:
+                msg_raw = self.sock.recv(32768)
+
+                if len(msg_raw) == 0: continue
+                msg = json.loads(msg_raw)
+
+                if msg['type'] == 'get':
+                    self.handle_get(msg)
+                elif msg['type'] == 'put':
+                    self.handle_put(msg)
+                else:
+                    log.warning('received unexpected type: ' + msg['type'])
+
+    def handle_get(self, msg):
+        log.success('received_get', id=self.id, client_id=msg['src'], key=msg['key'])
+        self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+
+    def handle_put(self, msg):
+        log.success('received_put', id=self.id, client_id=msg['src'], key=msg['key'], value=msg['value'])
+        self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+
+    def send_fail_msg(self, dst, mid):
+        # sends a message of type fail to the given dst with the given MID
+        log.info("replied_with_fail", id=self.id, client_id=dst)
+        msg = {'src': my_id,
+               'dst': dst,
+               'leader': self.leader,
+               'type': 'fail',
+               'MID': mid}
+
+        self.send_msg(msg)
+
+    def send_msg(self, msg):
+        # takes in a dictionary, serializes it and sends it across the wire
+        try:
+            self.sock.send(json.dumps(msg))
+        except Exception, e:
+            log.info("Unable to send msg: " + msg)
+
+
+if __name__ == "__main__":
+    # Your ID number
+    my_id = sys.argv[1]
+
+    # The ID numbers of all the other replicas
+    replica_ids = sys.argv[2:]
+
+    log = Logger({
+        "server_start": "Server {id} starting up",
+        "received_get": "Server {id} receieved a GET request for key {key} from client {client_id}",
+        "received_put": "Server {id} receieved a PUT request for key/value {key}/{value} from client {client_id}",
+        "replied_with_fail": "Server {id} replied to client {client_id} with a fail message"
+    })
+
+    server = Server(my_id, replica_ids)
+
+    # start up the bridge
+    server.start()
