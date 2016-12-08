@@ -25,7 +25,15 @@ class Server():
 		self.voted_for = None  # candidateId that received vote in current term (or null if none)
 		self.votes_earned = 0  # votes earned during this term
 		self.last_heartbeat = 0  # last time we sent out a heartbeat in seconds
+
 		self.data_store = {} #  key/value pairs from clients, ie. the 'state machine'
+		self.log = [] #  a log entry looks like {'term': ..,
+												# 'key': .., 'value': .., 'MID':..., 'src': ...)
+		self.log.append('bs value') # (first index for log is 1)
+		self.commit_index = 0  #  index of highest log entry known to be committted
+		self.last_applied = 0  #  index of highest log entry applied to data_store
+		self.next_index = {}  #  for each server, index of the next log entry to send to that server
+		self.match_index = {}  #  for each server, index of highest log entry known to be replicated on server
 
 		# Connect to the network. All messages to/from other replicas and clients will
 		# occur over this socket
@@ -49,12 +57,28 @@ class Server():
 
 	def start(self):
 		while True:
+			#print '{} thinks the leader is {}'.format(self.id, self.leader)
 			if self.election_timeout_reached():
 				self.begin_election()
 			elif self.is_candidate:
 				self.check_candidate_status()
 			elif self.is_leader():
 				self.broadcast_hearbeat()
+
+			if self.commit_index > self.last_applied:
+				#  have some log entries we can apply to state machine
+				self.last_applied += 1
+				log_entry = self.log[self.last_applied]
+				self.data_store[log_entry['key']] = log_entry['value']
+				log.success("applied_log_entry", id=self.id, index=self.last_applied,
+					key=log_entry['key'], value=log_entry['value'])
+
+				if self.is_leader():
+					self.send_ok_put_msg(dst=log_entry['src'], mid=log_entry['MID'])
+
+			if self.is_leader():
+				self.update_commit_index()
+				self.check_to_send_append_entries()
 
 			ready = select.select([self.sock], [], [], 0.1)[0]
 
@@ -64,6 +88,19 @@ class Server():
 				if len(msg_raw) == 0: continue
 				msg = json.loads(msg_raw)
 
+				other_term = msg.get('term')
+
+				if other_term is not None:
+					#  this is an RPC from another server
+					if other_term > self.current_term:
+						log.success('term_update', id=self.id, old_term=self.current_term, new_term=other_term)
+						self.current_term = other_term
+
+						if self.is_leader():
+							print 'leader {} resetting leader to unknown'.format(self.id)
+							self.leader = 'FFFF'
+
+				# this are all the diff. types of messages
 				if msg['type'] == 'get':
 					self.handle_get(msg)
 				elif msg['type'] == 'put':
@@ -74,6 +111,8 @@ class Server():
 					self.handle_vote_result(msg)
 				elif msg['type'] == 'append_entries':
 					self.handle_append_entries(msg)
+				elif msg['type'] == 'append_entries_result' and self.is_leader():
+					self.handle_append_entries_result(msg)
 				else:
 					log.warning('received unexpected type: ' + msg['type'])
 
@@ -98,31 +137,75 @@ class Server():
 			self.redirect_msg(dst=msg['src'], mid=msg['MID'])
 		elif self.is_leader():
 			log.success('leader_put', id=self.id, key=msg['key'], value=msg['value'])
-			self.data_store[msg['key']] = msg['value']
-			self.send_ok_put_msg(dst=msg['src'], mid=msg['MID'])
+
+			#  append to log
+			log_entry = {'term': self.current_term,
+						 'key': msg['key'],
+						 'value': msg['value'],
+						 'MID': msg['MID'],
+						 'src': msg['src']}
+			self.log.append(log_entry)
 		else:
 			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
 	def handle_vote_request(self, msg):
+		self.last_heard_rpc = time()
 		if msg['term'] < self.current_term:
 			self.deny_vote(dst=msg['src'])
-		elif self.voted_for == None or self.voted_for == msg['src']:
-			# TODO: "and candidate's log is at least as up-to-date as receiver's log"
+		elif self.voted_for == None or self.voted_for == msg['src']\
+				and msg['last_log_index'] >= len(self.log) - 1:
+			# TODO maybe add last_log_term check
 			self.grant_vote(dst=msg['src'])
 
 	def handle_vote_result(self, msg):
+		self.last_heard_rpc = time()
 		if self.is_candidate and msg['vote_granted']:
 			log.success('received_vote', id=self.id, term=self.current_term, src=msg['src'])
 			self.votes_earned += 1
 
 	def handle_append_entries(self, msg):
 		self.last_heard_rpc = time()
-		if self.is_candidate and msg['term'] >= self.current_term:
+
+		#if self.is_candidate and msg['term'] >= self.current_term:
+		if self.is_leader_unknown() and msg['term'] >= self.current_term:
 			#  have found a new leader
 			log.success("found_new_leader", id=self.id, new_leader=msg['src'], new_term=msg['term'])
 			self.leader = msg['src']
 			self.current_term = msg['term']
 			self.reset_candidacy()
+		elif not self.is_candidate and len(msg['entries']) > 0:
+			if msg['term'] < self.current_term:
+				self.send_false_append_result(dst=msg['src'])
+				return
+
+			# 'Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm'
+			prev_log_term = msg['prev_log_term']
+			prev_log_index = msg['prev_log_index']
+			if prev_log_term > 0 and prev_log_index != 0 and (len(self.log) - 1) >= prev_log_index:
+				last_log_entry_term = self.log[prev_log_index]['term']
+				if last_log_entry_term != prev_log_term:
+					self.send_false_append_result(dst=msg['src'])
+					return
+
+			# safe to append entries now
+			self.log = self.log[:prev_log_index+1] #  delete any existing entries if there are any
+			for entry in msg['entries']:
+				self.log.append(entry)
+
+			if msg['leader_commit'] > self.commit_index:
+				last_log_index = len(self.log) - 1
+				self.commit_index = min(msg['leader_commit'], last_log_index)
+
+			self.send_true_append_result(dst=msg['src'], newest_index=len(self.log) - 1)
+
+	def handle_append_entries_result(self, msg):
+		if msg['success']:
+			newest_index_added = msg['newest_index']
+			self.next_index[msg['src']] = newest_index_added + 1
+			self.match_index[msg['src']] = newest_index_added
+		else:
+			#  this follower is behind, decrement next_index for him
+			self.next_index[msg['src']] -= 1
 
 	def send_fail_msg(self, dst, mid):
 		# sends a message of type fail to the given dst with the given MID
@@ -161,11 +244,11 @@ class Server():
 			   'dst': 'FFFF',  # broadcast
 			   'leader': self.leader,
 			   'type': 'request_vote',
-			   'term': self.current_term}
+			   'term': self.current_term,
+			   'last_log_index': len(self.log) - 1,
+			   'last_log_term': self.log[len(self.log) - 1]['term'] if len(self.log) > 1 else 0}
 
 		self.send_msg(msg)
-
-	# TODO: include lastLogIndex and lastLogTerm
 
 	def check_candidate_status(self):
 		if self.has_majority_votes():
@@ -174,6 +257,11 @@ class Server():
 			self.leader = self.id
 			self.reset_candidacy()
 			self.broadcast_hearbeat()
+
+			#  reintialize next_index and match_index after election as specified by paper
+			for r_id in replica_ids:
+				self.next_index[r_id] = len(self.log)
+				self.match_index[r_id] = 0
 
 	def broadcast_hearbeat(self):
 		curr_time = time()
@@ -222,6 +310,7 @@ class Server():
 		self.send_msg(msg)
 
 	def send_ok_put_msg(self, dst, mid):
+		#  response to client when the put was successful
 		msg = {'src': self.id,
 			   'dst': dst,
 			   'leader': self.leader,
@@ -239,6 +328,63 @@ class Server():
 			   'value': value}
 
 		self.send_msg(msg)
+
+	def check_to_send_append_entries(self):
+		for replica_id, next_idx in self.next_index.iteritems():
+			last_log_index = len(self.log) - 1
+			if last_log_index >= next_idx:
+				self.send_append_entries(dst=replica_id, start_index=next_idx)
+
+	def send_append_entries(self, dst, start_index):
+		msg = {'src': self.id,
+			   'dst': dst,
+			   'leader': self.leader,
+			   'type': 'append_entries',
+			   'term': self.current_term,
+			   'prev_log_index': start_index - 1,
+			   'prev_log_term': self.log[start_index - 1]['term'] if start_index != 1 else 0,
+			   'entries': self.log[start_index:],
+			   'leader_commit': self.commit_index}
+
+		self.send_msg(msg)
+
+	def send_true_append_result(self, dst, newest_index):
+		self.send_append_result(dst=dst, success = True, newest_index=newest_index)
+
+	def send_false_append_result(self, dst):
+		self.send_append_result(dst=dst, success=False)
+
+	def send_append_result(self, dst, success, newest_index=None):
+		msg = {'src': self.id,
+			   'dst': dst,
+			   'leader': self.leader,
+			   'type': 'append_entries_result',
+			   'term': self.current_term,
+			   'success': success}
+		if newest_index:
+			msg['newest_index'] = newest_index
+
+		self.send_msg(msg)
+
+	def update_commit_index(self):
+		highest_match_index = self.get_highest_match_index()
+
+		for i in range(self.commit_index+1, highest_match_index+1):
+			count = 0
+			if self.log[i]['term'] == self.current_term:
+				for replica_id, match_idx in self.match_index.iteritems():
+					if match_idx >= i:
+						count += 1
+				majority = ((len(replica_ids) + 1) // 2)  # number of servers needed for quorom
+				if count > majority:
+					self.commit_index = i
+
+	def get_highest_match_index(self):
+		so_far = 0
+		for replica_id, match_idx in self.match_index.iteritems():
+			if match_idx > so_far:
+				so_far = match_idx
+		return so_far
 
 
 if __name__ == "__main__":
@@ -258,8 +404,10 @@ if __name__ == "__main__":
 		"found_new_leader": "Server {id} has found the new leader: {new_leader} for term {new_term}",
 		"became_leader": "Server {id} has just become the leader for term {term} with {num_votes} votes",
 		"redirect": "Server {id} has redirected a request from client {client_id} to the leader {leader}",
-		"leader_put": "Leader {id} has put into the data_store key/value {key}/{value}",
-		"leader_get": "Leader {id} has responded to a GET request for key {key}"
+		"leader_put": "Leader {id} has received a PUT for key/value {key}/{value}",
+		"leader_get": "Leader {id} has responded to a GET request for key {key}",
+		"term_update": "Server {id} has updated it's term from {old_term} to {new_term}",
+		"applied_log_entry": "Server {id} has applied log index {index} with key/value {key}/{value}"
 	})
 
 	server = Server(my_id, replica_ids)
