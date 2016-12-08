@@ -8,7 +8,8 @@ from logger import Logger
 I tried my best to document, but this is all from the Raft paper
 '''
 
-HEARTBEAT_INTERVAL = .05  # every 50ms
+HEARTBEAT_INTERVAL = .05  #  50ms
+APPEND_ENTRIES_INTERVAL = .005 #  5 ms
 
 
 class Server():
@@ -25,6 +26,7 @@ class Server():
 		self.voted_for = None  # candidateId that received vote in current term (or null if none)
 		self.votes_earned = 0  # votes earned during this term
 		self.last_heartbeat = 0  # last time we sent out a heartbeat in seconds
+		self.last_append_entries = 0 # last time we sent out an append_entries in seconds
 
 		self.data_store = {} #  key/value pairs from clients, ie. the 'state machine'
 		self.log = [] #  a log entry looks like {'term': ..,
@@ -57,7 +59,7 @@ class Server():
 
 	def start(self):
 		while True:
-			#print '{} thinks the leader is {}'.format(self.id, self.leader)
+			#  print '{} thinks the leader is {}'.format(self.id, self.leader)
 			if self.election_timeout_reached():
 				self.begin_election()
 			elif self.is_candidate:
@@ -95,10 +97,8 @@ class Server():
 					if other_term > self.current_term:
 						log.success('term_update', id=self.id, old_term=self.current_term, new_term=other_term)
 						self.current_term = other_term
-
-						if self.is_leader():
-							print 'leader {} resetting leader to unknown'.format(self.id)
-							self.leader = 'FFFF'
+						# new term, gotta figure out who the leader is
+						self.leader = 'FFFF'
 
 				# this are all the diff. types of messages
 				if msg['type'] == 'get':
@@ -330,10 +330,13 @@ class Server():
 		self.send_msg(msg)
 
 	def check_to_send_append_entries(self):
-		for replica_id, next_idx in self.next_index.iteritems():
-			last_log_index = len(self.log) - 1
-			if last_log_index >= next_idx:
-				self.send_append_entries(dst=replica_id, start_index=next_idx)
+		curr_time = time()
+		if (curr_time - self.last_append_entries) > APPEND_ENTRIES_INTERVAL:
+			self.last_append_entries = curr_time
+			for replica_id, next_idx in self.next_index.iteritems():
+				last_log_index = len(self.log) - 1
+				if last_log_index >= next_idx:
+					self.send_append_entries(dst=replica_id, start_index=next_idx)
 
 	def send_append_entries(self, dst, start_index):
 		msg = {'src': self.id,
