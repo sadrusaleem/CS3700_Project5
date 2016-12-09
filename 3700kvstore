@@ -9,7 +9,7 @@ I tried my best to document, but this is all from the Raft paper
 '''
 
 HEARTBEAT_INTERVAL = .3  #  in seconds
-APPEND_ENTRIES_INTERVAL = .001 #  in seconds
+APPEND_ENTRIES_INTERVAL = .0005 #  in seconds
 MAX_ENTRIES = 10 #  max number of log entries to send per append_entries
 
 
@@ -63,7 +63,7 @@ class Server():
 
 	def start(self):
 		while True:
-			# print '{} thinks the leader is {}'.format(self.id, self.leader)
+			#print '{} thinks the leader is {}'.format(self.id, self.leader)
 			if self.election_timeout_reached():
 				self.begin_election()
 			elif self.is_candidate:
@@ -76,14 +76,19 @@ class Server():
 
 			if self.commit_index > self.last_applied:
 				#  have some log entries we can apply to state machine
-				self.last_applied += 1
-				log_entry = self.log[self.last_applied]
-				self.data_store[log_entry['key']] = log_entry['value']
-				log.success("applied_log_entry", id=self.id, index=self.last_applied,
-					key=log_entry['key'], value=log_entry['value'])
+				try:
+					log_entry = self.log[self.last_applied + 1]
+					self.data_store[log_entry['key']] = log_entry['value']
+					log.success("applied_log_entry", id=self.id, index=self.last_applied + 1,
+						key=log_entry['key'], value=log_entry['value'])
 
-				if self.is_leader():
-					self.send_ok_put_msg(dst=log_entry['src'], mid=log_entry['MID'])
+					if self.is_leader():
+						self.send_ok_put_msg(dst=log_entry['src'], mid=log_entry['MID'])
+				except:
+					log.error("{} had an error while applying index {}".format(self.id, self.last_applied + 1))
+				finally:
+					# can increment now since we know it was applied
+					self.last_applied += 1
 
 			ready = select.select([self.sock], [], [], 0.1)[0]
 
@@ -133,8 +138,8 @@ class Server():
 				self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=value)
 			else:
 				self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
-		else:
-			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+		# else:
+		# 	self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
 	def handle_put(self, msg):
 		log.success('received_put', id=self.id, client_id=msg['src'], key=msg['key'], value=msg['value'])
@@ -152,8 +157,8 @@ class Server():
 						 'MID': msg['MID'],
 						 'src': msg['src']}
 			self.log.append(log_entry)
-		else:
-			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+		# else:
+		# 	self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
 	def handle_vote_request(self, msg):
 		self.last_heard_rpc = time()
@@ -162,6 +167,7 @@ class Server():
 		elif self.voted_for == None or self.voted_for == msg['src']\
 				and msg['last_log_index'] >= len(self.log) - 1:
 			# TODO maybe add last_log_term check
+			self.voted_for = msg['src']
 			self.grant_vote(dst=msg['src'])
 
 	def handle_vote_result(self, msg):
@@ -402,7 +408,7 @@ class Server():
 					for replica_id, match_idx in self.match_index.iteritems():
 						if match_idx >= i:
 							count += 1
-					majority = ((len(replica_ids) + 1) // 2)  # number of servers needed for quorom
+					majority = (len(replica_ids) // 2) + 1 # number of servers needed for quorom
 					if count > majority:
 						self.commit_index = i
 		except Exception, e:
