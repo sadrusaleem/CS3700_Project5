@@ -8,8 +8,8 @@ from logger import Logger
 I tried my best to document, but this is all from the Raft paper
 '''
 
-HEARTBEAT_INTERVAL = .3  #  100ms
-APPEND_ENTRIES_INTERVAL = .001 #  5 ms
+HEARTBEAT_INTERVAL = .3  #  in seconds
+APPEND_ENTRIES_INTERVAL = .001 #  in seconds
 MAX_ENTRIES = 10 #  max number of log entries to send per append_entries
 
 
