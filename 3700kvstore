@@ -138,8 +138,8 @@ class Server():
 				self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=value)
 			else:
 				self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
-		# else:
-		# 	self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+		else:
+			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
 	def handle_put(self, msg):
 		log.success('received_put', id=self.id, client_id=msg['src'], key=msg['key'], value=msg['value'])
@@ -277,9 +277,9 @@ class Server():
 				self.match_index[r_id] = 0
 
 	def broadcast_hearbeat(self, force=False):
-		self.heartbeat_count += 1
-		if self.heartbeat_count % 500 == 0:
-			print 'heartbeats: {}'.format(self.heartbeat_count)
+		# self.heartbeat_count += 1
+		# if self.heartbeat_count % 500 == 0:
+		# 	print 'heartbeats: {}'.format(self.heartbeat_count)
 
 		curr_time = time()
 		if force or ((curr_time - self.last_heartbeat) > HEARTBEAT_INTERVAL):
@@ -360,9 +360,9 @@ class Server():
 
 	def send_append_entries(self, dst, start_index):
 		log.success("append_entries", id=self.id, dst=dst, start_index=start_index)
-		self.append_entries_count += 1
-		if self.append_entries_count % 500 == 0:
-			print 'append entries: {}'.format(self.append_entries_count)
+		# self.append_entries_count += 1
+		# if self.append_entries_count % 500 == 0:
+		# 	print 'append entries: {}'.format(self.append_entries_count)
 
 		entries = self.log[start_index:]
 
@@ -408,7 +408,7 @@ class Server():
 					for replica_id, match_idx in self.match_index.iteritems():
 						if match_idx >= i:
 							count += 1
-					majority = (len(replica_ids) // 2) + 1 # number of servers needed for quorom
+					majority = (len(replica_ids) // 2) # number of servers needed for quorom
 					if count > majority:
 						self.commit_index = i
 		except Exception, e:
