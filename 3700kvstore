@@ -8,8 +8,9 @@ from logger import Logger
 I tried my best to document, but this is all from the Raft paper
 '''
 
-HEARTBEAT_INTERVAL = .05  #  50ms
-APPEND_ENTRIES_INTERVAL = .005 #  5 ms
+HEARTBEAT_INTERVAL = .3  #  100ms
+APPEND_ENTRIES_INTERVAL = .001 #  5 ms
+MAX_ENTRIES = 10 #  max number of log entries to send per append_entries
 
 
 class Server():
@@ -21,14 +22,14 @@ class Server():
 		self.leader = 'FFFF'  # unknown leader
 		self.current_term = 0
 		self.last_heard_rpc = time()  # the last time we heard from a leader/candidate in seconds
-		self.election_timeout = random.uniform(.15, .3)  # 150-300 ms, in seconds
+		self.election_timeout = random.uniform(.4, .6)  # 150-300 ms is what the paper recommends
 		self.is_candidate = False
 		self.voted_for = None  # candidateId that received vote in current term (or null if none)
 		self.votes_earned = 0  # votes earned during this term
 		self.last_heartbeat = 0  # last time we sent out a heartbeat in seconds
 		self.last_append_entries = 0 # last time we sent out an append_entries in seconds
 
-		self.data_store = {} #  key/value pairs from clients, ie. the 'state machine'
+		self.data_store = {} #  key:value entries, ie. the 'state machine'
 		self.log = [] #  a log entry looks like {'term': ..,
 												# 'key': .., 'value': .., 'MID':..., 'src': ...)
 		self.log.append('bs value') # (first index for log is 1)
@@ -36,6 +37,10 @@ class Server():
 		self.last_applied = 0  #  index of highest log entry applied to data_store
 		self.next_index = {}  #  for each server, index of the next log entry to send to that server
 		self.match_index = {}  #  for each server, index of highest log entry known to be replicated on server
+
+		#for debugging
+		self.heartbeat_count = 0
+		self.append_entries_count = 0
 
 		# Connect to the network. All messages to/from other replicas and clients will
 		# occur over this socket
@@ -49,8 +54,7 @@ class Server():
 		return self.leader == 'FFFF'
 
 	def election_timeout_reached(self):
-		return (time() - self.last_heard_rpc) > self.election_timeout \
-			   and not self.is_leader()
+		return (time() - self.last_heard_rpc) > self.election_timeout and not self.is_leader()
 
 	def has_majority_votes(self):
 		majority = ((len(replica_ids) + 1) // 2) + 1  # number of servers needed for quorom
@@ -59,13 +63,16 @@ class Server():
 
 	def start(self):
 		while True:
-			#  print '{} thinks the leader is {}'.format(self.id, self.leader)
+			# print '{} thinks the leader is {}'.format(self.id, self.leader)
 			if self.election_timeout_reached():
 				self.begin_election()
 			elif self.is_candidate:
 				self.check_candidate_status()
 			elif self.is_leader():
+				self.update_commit_index()
+				self.check_to_send_append_entries()
 				self.broadcast_hearbeat()
+
 
 			if self.commit_index > self.last_applied:
 				#  have some log entries we can apply to state machine
@@ -77,10 +84,6 @@ class Server():
 
 				if self.is_leader():
 					self.send_ok_put_msg(dst=log_entry['src'], mid=log_entry['MID'])
-
-			if self.is_leader():
-				self.update_commit_index()
-				self.check_to_send_append_entries()
 
 			ready = select.select([self.sock], [], [], 0.1)[0]
 
@@ -124,8 +127,12 @@ class Server():
 			self.redirect_msg(dst=msg['src'], mid=msg['MID'])
 		elif self.is_leader():
 			log.success('leader_get', id=self.id, key=msg['key'])
-			value = self.data_store[msg['key']]
-			self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=value)
+			value = self.data_store.get(msg['key'])
+
+			if value:
+				self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=value)
+			else:
+				self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 		else:
 			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
@@ -256,17 +263,21 @@ class Server():
 			log.success("became_leader", id=self.id, term=self.current_term, num_votes = self.votes_earned)
 			self.leader = self.id
 			self.reset_candidacy()
-			self.broadcast_hearbeat()
+			self.broadcast_hearbeat(force=True)
 
 			#  reintialize next_index and match_index after election as specified by paper
 			for r_id in replica_ids:
 				self.next_index[r_id] = len(self.log)
 				self.match_index[r_id] = 0
 
-	def broadcast_hearbeat(self):
+	def broadcast_hearbeat(self, force=False):
+		self.heartbeat_count += 1
+		if self.heartbeat_count % 500 == 0:
+			print 'heartbeats: {}'.format(self.heartbeat_count)
+
 		curr_time = time()
-		if (curr_time - self.last_heartbeat) > HEARTBEAT_INTERVAL:
-			self.last_heartbeat = curr_time
+		if force or ((curr_time - self.last_heartbeat) > HEARTBEAT_INTERVAL):
+			self.last_heartbeat = time()
 			msg = {'src': self.id,
 				   'dst': 'FFFF',  # broadcast
 				   'leader': self.leader,
@@ -281,6 +292,7 @@ class Server():
 		self.reply_to_vote(dst=dst, vote_granted=False)
 
 	def grant_vote(self, dst):
+		log.success("grant_vote", id=self.id, to=dst, term=self.current_term)
 		self.reply_to_vote(dst=dst, vote_granted=True)
 
 	def reply_to_vote(self, dst, vote_granted):
@@ -333,12 +345,24 @@ class Server():
 		curr_time = time()
 		if (curr_time - self.last_append_entries) > APPEND_ENTRIES_INTERVAL:
 			self.last_append_entries = curr_time
+
+			last_log_index = len(self.log) - 1
 			for replica_id, next_idx in self.next_index.iteritems():
-				last_log_index = len(self.log) - 1
 				if last_log_index >= next_idx:
 					self.send_append_entries(dst=replica_id, start_index=next_idx)
+		#print '{} time has elapsed bbut we need it to be {}'.format(curr_time - self.last_append_entries, APPEND_ENTRIES_INTERVAL)
 
 	def send_append_entries(self, dst, start_index):
+		log.success("append_entries", id=self.id, dst=dst, start_index=start_index)
+		self.append_entries_count += 1
+		if self.append_entries_count % 500 == 0:
+			print 'append entries: {}'.format(self.append_entries_count)
+
+		entries = self.log[start_index:]
+
+		if len(entries) > MAX_ENTRIES:
+			entries = entries[:MAX_ENTRIES]
+
 		msg = {'src': self.id,
 			   'dst': dst,
 			   'leader': self.leader,
@@ -346,7 +370,7 @@ class Server():
 			   'term': self.current_term,
 			   'prev_log_index': start_index - 1,
 			   'prev_log_term': self.log[start_index - 1]['term'] if start_index != 1 else 0,
-			   'entries': self.log[start_index:],
+			   'entries': entries,
 			   'leader_commit': self.commit_index}
 
 		self.send_msg(msg)
@@ -371,16 +395,18 @@ class Server():
 
 	def update_commit_index(self):
 		highest_match_index = self.get_highest_match_index()
-
-		for i in range(self.commit_index+1, highest_match_index+1):
-			count = 0
-			if self.log[i]['term'] == self.current_term:
-				for replica_id, match_idx in self.match_index.iteritems():
-					if match_idx >= i:
-						count += 1
-				majority = ((len(replica_ids) + 1) // 2)  # number of servers needed for quorom
-				if count > majority:
-					self.commit_index = i
+		try:
+			for i in range(self.commit_index+1, highest_match_index+1):
+				count = 0
+				if self.log[i]['term'] == self.current_term:
+					for replica_id, match_idx in self.match_index.iteritems():
+						if match_idx >= i:
+							count += 1
+					majority = ((len(replica_ids) + 1) // 2)  # number of servers needed for quorom
+					if count > majority:
+						self.commit_index = i
+		except Exception, e:
+			log.error('{} failed update_commit_index. Error: {}'.format(self.id, str(e)))
 
 	def get_highest_match_index(self):
 		so_far = 0
@@ -410,8 +436,10 @@ if __name__ == "__main__":
 		"leader_put": "Leader {id} has received a PUT for key/value {key}/{value}",
 		"leader_get": "Leader {id} has responded to a GET request for key {key}",
 		"term_update": "Server {id} has updated it's term from {old_term} to {new_term}",
-		"applied_log_entry": "Server {id} has applied log index {index} with key/value {key}/{value}"
-	})
+		"applied_log_entry": "Server {id} has applied log index {index} with key/value {key}/{value}",
+		"grant_vote": "Server {id} is granting a vote to {to} for term {term}",
+		"append_entries": "Leader {id} is sending append entries to {dst} for start_index: {start_index}"
+	}, enabled=False)
 
 	server = Server(my_id, replica_ids)
 
