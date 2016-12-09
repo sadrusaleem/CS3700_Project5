@@ -409,7 +409,7 @@ class Server():
 						if match_idx >= i:
 							count += 1
 					majority = (len(replica_ids) // 2) # number of servers needed for quorom
-					if count > majority:
+					if count >= majority:
 						self.commit_index = i
 		except Exception, e:
 			log.error('{} failed update_commit_index. Error: {}'.format(self.id, str(e)))
@@ -445,7 +445,7 @@ if __name__ == "__main__":
 		"applied_log_entry": "Server {id} has applied log index {index} with key/value {key}/{value}",
 		"grant_vote": "Server {id} is granting a vote to {to} for term {term}",
 		"append_entries": "Leader {id} is sending append entries to {dst} for start_index: {start_index}"
-	}, enabled=False)
+	}, enabled=True)
 
 	server = Server(my_id, replica_ids)
 
