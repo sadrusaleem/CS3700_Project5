@@ -447,7 +447,7 @@ class Server():
 				log.success("applied_log_entry", id=self.id, index=self.last_applied + 1,
 							key=log_entry['key'], value=log_entry['value'])
 
-				if self.is_leader() or self.is_leader_unknown():
+				if self.is_leader() or self.is_leader_unknown() or True:
 					self.send_ok_put_msg(dst=log_entry['src'], mid=log_entry['MID'])
 			except:
 				log.error("{} had an error while applying index {}".format(self.id, self.last_applied + 1))
