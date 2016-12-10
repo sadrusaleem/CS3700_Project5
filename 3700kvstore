@@ -13,6 +13,9 @@ APPEND_ENTRIES_INTERVAL = .0005 #  in seconds
 MAX_ENTRIES = 10 #  max number of log entries to send per append_entries
 
 
+RAND_ELECTION_TIMEOUT_MIN = .4 # in seconds
+RAND_ELECTION_TIMEOUT_MAX = .6 # 150-300 ms is what the paper
+
 class Server():
 	def __init__(self, my_id, replica_ids):
 		log.success("server_start", id=my_id)
@@ -22,7 +25,7 @@ class Server():
 		self.leader = 'FFFF'  # unknown leader
 		self.current_term = 0
 		self.last_heard_rpc = time()  # the last time we heard from a leader/candidate in seconds
-		self.election_timeout = random.uniform(.4, .6)  # 150-300 ms is what the paper recommends
+		self.election_timeout = random.uniform(RAND_ELECTION_TIMEOUT_MIN, RAND_ELECTION_TIMEOUT_MAX)
 		self.is_candidate = False
 		self.voted_for = None  # candidateId that received vote in current term (or null if none)
 		self.votes_earned = 0  # votes earned during this term
@@ -169,6 +172,8 @@ class Server():
 			# TODO maybe add last_log_term check
 			self.voted_for = msg['src']
 			self.grant_vote(dst=msg['src'])
+		else:
+			self.deny_vote(dst=msg['src'])
 
 	def handle_vote_result(self, msg):
 		self.last_heard_rpc = time()
@@ -177,17 +182,17 @@ class Server():
 			self.votes_earned += 1
 
 	def handle_append_entries(self, msg):
-		self.last_heard_rpc = time()
-
 		#if self.is_candidate and msg['term'] >= self.current_term:
 		if self.is_leader_unknown() and msg['term'] >= self.current_term:
 			#  have found a new leader
+			self.last_heard_rpc = time()
 			log.success("found_new_leader", id=self.id, new_leader=msg['src'], new_term=msg['term'])
 			self.leader = msg['src']
 			self.current_term = msg['term']
 			self.reset_candidacy()
 		elif not self.is_candidate and len(msg['entries']) > 0:
 			if msg['term'] < self.current_term:
+				print '{}: replied False because of the term. Ours: {}, Theirs: {}'.format(self.id, self.current_term, msg['term'])
 				self.send_false_append_result(dst=msg['src'])
 				return
 
@@ -197,9 +202,11 @@ class Server():
 			if prev_log_term > 0 and prev_log_index != 0 and (len(self.log) - 1) >= prev_log_index:
 				last_log_entry_term = self.log[prev_log_index]['term']
 				if last_log_entry_term != prev_log_term:
+					print '{}: replied False because of the prevlogstuff'.format(self.id)
 					self.send_false_append_result(dst=msg['src'])
 					return
 
+			self.last_heard_rpc = time()
 			# safe to append entries now
 			self.log = self.log[:prev_log_index+1] #  delete any existing entries if there are any
 			for entry in msg['entries']:
@@ -210,6 +217,9 @@ class Server():
 				self.commit_index = min(msg['leader_commit'], last_log_index)
 
 			self.send_true_append_result(dst=msg['src'], newest_index=len(self.log) - 1)
+		elif len(msg['entries']) == 0:
+			# heartbeat
+			self.last_heard_rpc = time()
 
 	def handle_append_entries_result(self, msg):
 		if msg['success']:
@@ -245,6 +255,7 @@ class Server():
 		self.current_term += 1
 		self.is_candidate = True
 		self.last_heard_rpc = time()  # restart election timeout countdown
+		# self.randomize_election_timeout()
 
 		# vote for self
 		self.voted_for = self.id
@@ -253,6 +264,7 @@ class Server():
 		self.send_request_votes()
 
 	def send_request_votes(self):
+		log.success("send_request_votes", id=self.id, term=self.current_term, last_log_index=len(self.log) - 1)
 		msg = {'src': self.id,
 			   'dst': 'FFFF',  # broadcast
 			   'leader': self.leader,
@@ -295,6 +307,7 @@ class Server():
 			self.send_msg(msg)
 
 	def deny_vote(self, dst):
+		log.success("deny_vote", id=self.id, to=dst, term=self.current_term)
 		self.reply_to_vote(dst=dst, vote_granted=False)
 
 	def grant_vote(self, dst):
@@ -388,6 +401,7 @@ class Server():
 		self.send_append_result(dst=dst, success=False)
 
 	def send_append_result(self, dst, success, newest_index=None):
+		log.success('send_append_result', id=self.id, dst=dst, success=success)
 		msg = {'src': self.id,
 			   'dst': dst,
 			   'leader': self.leader,
@@ -421,6 +435,9 @@ class Server():
 				so_far = match_idx
 		return so_far
 
+	def randomize_election_timeout(self):
+		self.election_timeout = random.uniform(RAND_ELECTION_TIMEOUT_MIN, RAND_ELECTION_TIMEOUT_MAX)
+
 
 if __name__ == "__main__":
 	# Your ID number
@@ -428,7 +445,6 @@ if __name__ == "__main__":
 
 	# The ID numbers of all the other replicas
 	replica_ids = sys.argv[2:]
-
 	log = Logger({
 		"server_start": "Server {id} starting up",
 		"received_get": "Server {id} receieved a GET request for key {key} from client {client_id}",
@@ -444,8 +460,11 @@ if __name__ == "__main__":
 		"term_update": "Server {id} has updated it's term from {old_term} to {new_term}",
 		"applied_log_entry": "Server {id} has applied log index {index} with key/value {key}/{value}",
 		"grant_vote": "Server {id} is granting a vote to {to} for term {term}",
-		"append_entries": "Leader {id} is sending append entries to {dst} for start_index: {start_index}"
-	}, enabled=True)
+		"append_entries": "Leader {id} is sending append entries to {dst} for start_index: {start_index}",
+		"send_append_result": "Server {id} has replied to {dst}'s append_entries with a {success}",
+		"deny_vote": "Server {id} has DENIED the vote to {to} for term {term}",
+		"send_request_votes": "Server {id} is requesting votes for term {term} with last_log_index {last_log_index}"
+	}, enabled=False)
 
 	server = Server(my_id, replica_ids)
 
