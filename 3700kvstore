@@ -28,6 +28,7 @@ class Server():
 		self.election_timeout = random.uniform(RAND_ELECTION_TIMEOUT_MIN, RAND_ELECTION_TIMEOUT_MAX)
 		self.is_candidate = False
 		self.voted_for = None  # candidateId that received vote in current term (or null if none)
+		self.voted_for_index = 0
 		self.votes_earned = 0  # votes earned during this term
 		self.last_heartbeat = 0  # last time we sent out a heartbeat in seconds
 		self.last_append_entries = 0 # last time we sent out an append_entries in seconds
@@ -66,66 +67,55 @@ class Server():
 
 	def start(self):
 		while True:
-			#print '{} thinks the leader is {}'.format(self.id, self.leader)
-			if self.election_timeout_reached():
-				self.begin_election()
-			elif self.is_candidate:
-				self.check_candidate_status()
-			elif self.is_leader():
-				self.update_commit_index()
-				self.check_to_send_append_entries()
-				self.broadcast_hearbeat()
+			try:
+				#print '{} thinks the leader is {}'.format(self.id, self.leader)
+				if self.election_timeout_reached():
+					self.begin_election()
+				elif self.is_candidate:
+					self.check_candidate_status()
+				elif self.is_leader():
+					self.update_commit_index()
+					self.check_to_send_append_entries()
+					self.broadcast_hearbeat()
 
+				self.apply_indexes()
 
-			if self.commit_index > self.last_applied:
-				#  have some log entries we can apply to state machine
-				try:
-					log_entry = self.log[self.last_applied + 1]
-					self.data_store[log_entry['key']] = log_entry['value']
-					log.success("applied_log_entry", id=self.id, index=self.last_applied + 1,
-						key=log_entry['key'], value=log_entry['value'])
+				ready = select.select([self.sock], [], [], 0.1)[0]
 
-					if self.is_leader():
-						self.send_ok_put_msg(dst=log_entry['src'], mid=log_entry['MID'])
-				except:
-					log.error("{} had an error while applying index {}".format(self.id, self.last_applied + 1))
-				finally:
-					# can increment now since we know it was applied
-					self.last_applied += 1
+				if self.sock in ready:
+					msg_raw = self.sock.recv(32768)
 
-			ready = select.select([self.sock], [], [], 0.1)[0]
+					if len(msg_raw) == 0: continue
+					msg = json.loads(msg_raw)
 
-			if self.sock in ready:
-				msg_raw = self.sock.recv(32768)
+					other_term = msg.get('term')
 
-				if len(msg_raw) == 0: continue
-				msg = json.loads(msg_raw)
+					if other_term is not None:
+						#  this is an RPC from another server
+						if other_term > self.current_term:
+							log.success('term_update', id=self.id, old_term=self.current_term, new_term=other_term)
+							self.current_term = other_term
+							# new term, gotta figure out who the leader is
+							self.leader = 'FFFF'
+							self.reset_candidacy()
 
-				other_term = msg.get('term')
-
-				if other_term is not None:
-					#  this is an RPC from another server
-					if other_term > self.current_term:
-						log.success('term_update', id=self.id, old_term=self.current_term, new_term=other_term)
-						self.current_term = other_term
-						# new term, gotta figure out who the leader is
-						self.leader = 'FFFF'
-
-				# this are all the diff. types of messages
-				if msg['type'] == 'get':
-					self.handle_get(msg)
-				elif msg['type'] == 'put':
-					self.handle_put(msg)
-				elif msg['type'] == 'request_vote':
-					self.handle_vote_request(msg)
-				elif msg['type'] == 'request_vote_result':
-					self.handle_vote_result(msg)
-				elif msg['type'] == 'append_entries':
-					self.handle_append_entries(msg)
-				elif msg['type'] == 'append_entries_result' and self.is_leader():
-					self.handle_append_entries_result(msg)
-				else:
-					log.warning('received unexpected type: ' + msg['type'])
+					# this are all the diff. types of messages
+					if msg['type'] == 'get':
+						self.handle_get(msg)
+					elif msg['type'] == 'put':
+						self.handle_put(msg)
+					elif msg['type'] == 'request_vote':
+						self.handle_vote_request(msg)
+					elif msg['type'] == 'request_vote_result':
+						self.handle_vote_result(msg)
+					elif msg['type'] == 'append_entries':
+						self.handle_append_entries(msg)
+					elif msg['type'] == 'append_entries_result' and self.is_leader():
+						self.handle_append_entries_result(msg)
+					else:
+						log.warning('received unexpected type: ' + msg['type'])
+			except Exception, e:
+				log.error('UNKNOWN ERROR: {}'.format(str(e)))
 
 	def handle_get(self, msg):
 		log.success('received_get', id=self.id, client_id=msg['src'], key=msg['key'])
@@ -137,10 +127,10 @@ class Server():
 			log.success('leader_get', id=self.id, key=msg['key'])
 			value = self.data_store.get(msg['key'])
 
-			if value:
-				self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=value)
-			else:
-				self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
+			self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=value if value else "")
+		elif self.is_leader_unknown() and self.data_store.get(msg['key']):
+			# if ex-leader gets a GET request
+			self.send_ok_get_msg(dst=msg['src'], mid=msg['MID'], value=self.data_store.get(msg['key']))
 		else:
 			self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
@@ -164,15 +154,24 @@ class Server():
 		# 	self.send_fail_msg(dst=msg['src'], mid=msg['MID'])
 
 	def handle_vote_request(self, msg):
-		self.last_heard_rpc = time()
 		if msg['term'] < self.current_term:
+			#print '1deny: ' + str(msg)
 			self.deny_vote(dst=msg['src'])
-		elif self.voted_for == None or self.voted_for == msg['src']\
+		elif (self.voted_for == None or self.voted_for == msg['src'])\
 				and msg['last_log_index'] >= len(self.log) - 1:
 			# TODO maybe add last_log_term check
+			self.last_heard_rpc = time()
 			self.voted_for = msg['src']
+			self.voted_for_index = msg['last_log_index']
+			self.grant_vote(dst=msg['src'])
+		elif (msg['last_log_index'] >= (len(self.log) - 1))\
+				and msg['last_log_index'] > self.voted_for_index:
+			self.last_heard_rpc = time()
+			self.voted_for = msg['src']
+			self.voted_for_index = msg['last_log_index']
 			self.grant_vote(dst=msg['src'])
 		else:
+			#print '{}: 2deny: votedFor = {}, our_index = {}'.format(self.id, self.voted_for, len(self.log) - 1) + str(msg)
 			self.deny_vote(dst=msg['src'])
 
 	def handle_vote_result(self, msg):
@@ -192,7 +191,7 @@ class Server():
 			self.reset_candidacy()
 		elif not self.is_candidate and len(msg['entries']) > 0:
 			if msg['term'] < self.current_term:
-				print '{}: replied False because of the term. Ours: {}, Theirs: {}'.format(self.id, self.current_term, msg['term'])
+				#print '{}: replied False because of the term. Ours: {}, Theirs: {}'.format(self.id, self.current_term, msg['term'])
 				self.send_false_append_result(dst=msg['src'])
 				return
 
@@ -202,7 +201,7 @@ class Server():
 			if prev_log_term > 0 and prev_log_index != 0 and (len(self.log) - 1) >= prev_log_index:
 				last_log_entry_term = self.log[prev_log_index]['term']
 				if last_log_entry_term != prev_log_term:
-					print '{}: replied False because of the prevlogstuff'.format(self.id)
+					#print '{}: replied False because of the prevlogstuff'.format(self.id)
 					self.send_false_append_result(dst=msg['src'])
 					return
 
@@ -217,7 +216,7 @@ class Server():
 				self.commit_index = min(msg['leader_commit'], last_log_index)
 
 			self.send_true_append_result(dst=msg['src'], newest_index=len(self.log) - 1)
-		elif len(msg['entries']) == 0:
+		elif len(msg['entries']) == 0 and msg['term'] >= self.current_term:
 			# heartbeat
 			self.last_heard_rpc = time()
 
@@ -255,7 +254,7 @@ class Server():
 		self.current_term += 1
 		self.is_candidate = True
 		self.last_heard_rpc = time()  # restart election timeout countdown
-		# self.randomize_election_timeout()
+		#  self.randomize_election_timeout()
 
 		# vote for self
 		self.voted_for = self.id
@@ -329,6 +328,7 @@ class Server():
 		self.is_candidate = False
 		self.voted_for = None
 		self.votes_earned = 0
+		self.voted_for_index = 0
 
 	def redirect_msg(self, dst, mid):
 		log.success("redirect", id=self.id, client_id=dst, leader=self.leader)
@@ -437,6 +437,24 @@ class Server():
 
 	def randomize_election_timeout(self):
 		self.election_timeout = random.uniform(RAND_ELECTION_TIMEOUT_MIN, RAND_ELECTION_TIMEOUT_MAX)
+
+	def apply_indexes(self):
+		while self.commit_index > self.last_applied:
+			#  have some log entries we can apply to state machine
+			try:
+				log_entry = self.log[self.last_applied + 1]
+				self.data_store[log_entry['key']] = log_entry['value']
+				log.success("applied_log_entry", id=self.id, index=self.last_applied + 1,
+							key=log_entry['key'], value=log_entry['value'])
+
+				if self.is_leader() or self.is_leader_unknown():
+					self.send_ok_put_msg(dst=log_entry['src'], mid=log_entry['MID'])
+			except:
+				log.error("{} had an error while applying index {}".format(self.id, self.last_applied + 1))
+				break
+			finally:
+				# can increment now since we know it was applied
+				self.last_applied += 1
 
 
 if __name__ == "__main__":
